@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "padel-shot-classifier"
+version = "0.1.0"
+description = "A classifier for padel shots"
+authors = ["Jake Bayley <jakebayley97@gmail.com>"]
+readme = "README.md"
+packages = [{include = "padel_shot_classifier", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.13"
+
+[tool.poetry.group.dev.dependencies]
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"

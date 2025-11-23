@@ -605,5 +605,466 @@ class TestBoundaryRefinementEndToEnd:
         assert len(shots_without) >= 1
 
 
+class TestEnhancedConfidenceScoring:
+    """Tests for enhanced confidence scoring with additional factors."""
+
+    def test_new_confidence_parameters(self):
+        """Test that new parameters are properly initialized."""
+        detector = ShotDetector()
+        assert detector.type_confidence_threshold == 0.5
+        assert detector.low_confidence_threshold == 0.7
+
+        detector = ShotDetector(
+            type_confidence_threshold=0.6,
+            low_confidence_threshold=0.8
+        )
+        assert detector.type_confidence_threshold == 0.6
+        assert detector.low_confidence_threshold == 0.8
+
+    def test_peak_prominence_score_clear_peak(self):
+        """Test peak prominence score with clear peak."""
+        detector = ShotDetector()
+
+        # Clear peak
+        velocity = np.array([0.01, 0.02, 0.05, 0.15, 0.1, 0.05, 0.02, 0.01])
+        score = detector._calculate_peak_prominence_score(velocity)
+        assert 0.5 < score <= 1.0  # Should be high for clear peak
+
+    def test_peak_prominence_score_flat_signal(self):
+        """Test peak prominence score with flat signal."""
+        detector = ShotDetector()
+
+        # Flat signal
+        velocity = np.array([0.05, 0.05, 0.05, 0.05, 0.05])
+        score = detector._calculate_peak_prominence_score(velocity)
+        assert score <= 0.5  # Should be low for flat signal
+
+    def test_peak_prominence_score_short_signal(self):
+        """Test peak prominence score with very short signal."""
+        detector = ShotDetector()
+
+        # Too short
+        velocity = np.array([0.01, 0.02])
+        score = detector._calculate_peak_prominence_score(velocity)
+        assert score == 0.0
+
+    def test_snr_score_clear_signal(self):
+        """Test SNR score with clear signal."""
+        detector = ShotDetector()
+
+        # Clear signal with distinct peak
+        velocity = np.array([0.01, 0.01, 0.01, 0.15, 0.01, 0.01, 0.01])
+        score = detector._calculate_snr_score(velocity)
+        assert score > 0.5  # Should be high for clear signal
+
+    def test_snr_score_low_signal(self):
+        """Test SNR score with low signal values."""
+        detector = ShotDetector()
+
+        # Low amplitude signal - the max is not much larger than the noise floor
+        velocity = np.array([0.001, 0.002, 0.001, 0.003, 0.001, 0.002, 0.001])
+        score = detector._calculate_snr_score(velocity)
+        # Just verify it returns a valid score in range
+        assert 0.0 <= score <= 1.0
+
+    def test_snr_score_short_signal(self):
+        """Test SNR score with very short signal."""
+        detector = ShotDetector()
+
+        velocity = np.array([0.01, 0.02])
+        score = detector._calculate_snr_score(velocity)
+        assert score == 0.0
+
+    def test_duration_score_optimal(self):
+        """Test duration score for optimal duration."""
+        detector = ShotDetector()
+
+        # Optimal duration (30-60 frames)
+        score = detector._calculate_duration_score(45)
+        assert score == 1.0
+
+    def test_duration_score_too_short(self):
+        """Test duration score for too short duration."""
+        detector = ShotDetector()
+
+        score = detector._calculate_duration_score(15)
+        assert 0.3 <= score < 1.0
+
+    def test_duration_score_too_long(self):
+        """Test duration score for too long duration."""
+        detector = ShotDetector()
+
+        score = detector._calculate_duration_score(100)
+        assert 0.3 <= score < 1.0
+
+    def test_enhanced_confidence_calculation(self):
+        """Test that enhanced confidence uses all factors."""
+        detector = ShotDetector(
+            height_threshold=0.1,
+            min_duration=10,
+            confidence_threshold=0.0,
+        )
+
+        # Create test signals
+        height_signal = np.array([0.0] * 10 + [0.2] * 30 + [0.0] * 10)
+        velocity_signal = np.array([0.01] * 10 + [0.01, 0.02, 0.05, 0.1, 0.15, 0.1, 0.05, 0.02] + [0.01] * 12 + [0.01] * 10 + [0.01] * 10)
+        pose_quality = np.ones(50)
+
+        confidence = detector._calculate_confidence(
+            height_signal, velocity_signal, pose_quality, 10, 40
+        )
+
+        assert 0.0 <= confidence <= 1.0
+
+
+class TestTypePrediction:
+    """Tests for shot type prediction functionality."""
+
+    def create_pose_with_height_velocity(self, wrist_y=0.3, shoulder_y=0.5, offset=0.0):
+        """Create a pose with specified height and implied velocity (via offset)."""
+        return {
+            'keypoints': {
+                'RIGHT_WRIST': {'x': 0.5 + offset, 'y': wrist_y, 'z': 0.0},
+                'RIGHT_SHOULDER': {'x': 0.5, 'y': shoulder_y, 'z': 0.0},
+                'RIGHT_ELBOW': {'x': 0.5, 'y': 0.4, 'z': 0.0},
+                'LEFT_WRIST': {'x': 0.4, 'y': 0.3, 'z': 0.0},
+                'LEFT_SHOULDER': {'x': 0.4, 'y': 0.5, 'z': 0.0},
+                'LEFT_ELBOW': {'x': 0.4, 'y': 0.4, 'z': 0.0},
+                'LEFT_HIP': {'x': 0.4, 'y': 0.7, 'z': 0.0},
+                'RIGHT_HIP': {'x': 0.6, 'y': 0.7, 'z': 0.0},
+                'NOSE': {'x': 0.5, 'y': 0.2, 'z': 0.0},
+            }
+        }
+
+    def test_smash_score_high(self):
+        """Test smash score for high height and velocity."""
+        detector = ShotDetector()
+        score = detector._smash_score(0.9, 0.9)
+        assert score > 0.5
+
+    def test_smash_score_low(self):
+        """Test smash score for low height and velocity."""
+        detector = ShotDetector()
+        score = detector._smash_score(0.3, 0.3)
+        assert score == 0.0
+
+    def test_vibora_score_optimal(self):
+        """Test vibora score for optimal medium values."""
+        detector = ShotDetector()
+        score = detector._vibora_score(0.65, 0.55)
+        assert score > 0.7  # Should be high for optimal values
+
+    def test_vibora_score_extreme(self):
+        """Test vibora score for extreme values."""
+        detector = ShotDetector()
+        # Very low values
+        score_low = detector._vibora_score(0.1, 0.1)
+        # Very high values
+        score_high = detector._vibora_score(0.95, 0.95)
+
+        assert score_low < 0.5
+        assert score_high < 0.5
+
+    def test_bandeja_score_low_values(self):
+        """Test bandeja score for low height and velocity."""
+        detector = ShotDetector()
+        score = detector._bandeja_score(0.2, 0.2)
+        assert score > 0.5  # Should be high for low values
+
+    def test_bandeja_score_high_values(self):
+        """Test bandeja score for high height and velocity."""
+        detector = ShotDetector()
+        score = detector._bandeja_score(0.9, 0.9)
+        assert score < 0.3  # Should be low for high values
+
+    def test_classify_by_features_smash(self):
+        """Test classification returns smash for high values."""
+        detector = ShotDetector()
+        shot_type, confidence = detector._classify_by_features(0.9, 0.9)
+        assert shot_type == "smash"
+        assert confidence > 0.3
+
+    def test_classify_by_features_vibora(self):
+        """Test classification returns vibora for medium values."""
+        detector = ShotDetector()
+        shot_type, confidence = detector._classify_by_features(0.65, 0.55)
+        assert shot_type == "vibora"
+        assert confidence > 0.3
+
+    def test_classify_by_features_bandeja(self):
+        """Test classification returns bandeja for low values."""
+        detector = ShotDetector()
+        shot_type, confidence = detector._classify_by_features(0.2, 0.2)
+        assert shot_type == "bandeja"
+        assert confidence > 0.3
+
+    def test_predict_shot_type_returns_tuple(self):
+        """Test that predict_shot_type returns proper tuple."""
+        detector = ShotDetector()
+
+        pose_data = [self.create_pose_with_height_velocity() for _ in range(30)]
+        velocity_signal = np.array([0.01] * 5 + [0.02, 0.05, 0.1, 0.15, 0.1, 0.05, 0.02] + [0.01] * 18)
+        height_signal = np.array([0.2] * 30)
+
+        shot_type, confidence = detector._predict_shot_type(
+            pose_data, velocity_signal, height_signal, 5, 20
+        )
+
+        assert isinstance(shot_type, str)
+        assert shot_type in ["smash", "vibora", "bandeja", "unknown"]
+        assert 0.0 <= confidence <= 1.0
+
+    def test_predict_shot_type_empty_window(self):
+        """Test type prediction with empty/NaN window."""
+        detector = ShotDetector()
+
+        pose_data = []
+        velocity_signal = np.array([np.nan] * 10)
+        height_signal = np.array([np.nan] * 10)
+
+        shot_type, confidence = detector._predict_shot_type(
+            pose_data, velocity_signal, height_signal, 0, 10
+        )
+
+        assert shot_type == "unknown"
+        assert confidence == 0.0
+
+
+class TestTypeConfidenceScoring:
+    """Tests for type confidence scoring."""
+
+    def test_confidence_margin_affects_score(self):
+        """Test that larger margin between scores gives higher confidence."""
+        detector = ShotDetector()
+
+        # Clear smash (high margin)
+        _, conf_clear = detector._classify_by_features(0.95, 0.95)
+
+        # Ambiguous (low margin) - values where multiple types have similar scores
+        _, conf_ambiguous = detector._classify_by_features(0.45, 0.45)
+
+        assert conf_clear >= conf_ambiguous
+
+    def test_type_unknown_below_threshold(self):
+        """Test that type is unknown when confidence below threshold."""
+        detector = ShotDetector(
+            height_threshold=0.1,
+            min_duration=10,
+            confidence_threshold=0.0,
+            type_confidence_threshold=0.99,  # Very high threshold
+        )
+
+        # Create basic shot
+        poses = []
+        for i in range(40):
+            if 10 <= i < 30:
+                poses.append(create_test_pose(wrist_y=0.3, shoulder_y=0.5))
+            else:
+                poses.append(create_test_pose(wrist_y=0.6, shoulder_y=0.5))
+
+        shots = detector.detect(poses)
+
+        # Most shots should be unknown due to high threshold
+        if len(shots) > 0:
+            assert shots[0].shot_type == "unknown"
+
+
+class TestLowConfidenceFlagging:
+    """Tests for low confidence flagging functionality."""
+
+    def test_low_confidence_field_default(self):
+        """Test that low_confidence field has correct default."""
+        shot = DetectedShot(
+            start_frame=10,
+            end_frame=30,
+            confidence=0.85,
+        )
+        assert shot.low_confidence is False
+
+    def test_low_confidence_flagging(self):
+        """Test that low confidence shots are flagged."""
+        detector = ShotDetector(
+            height_threshold=0.1,
+            min_duration=10,
+            confidence_threshold=0.0,  # Accept all
+            low_confidence_threshold=0.99,  # Almost all will be low confidence
+        )
+
+        poses = []
+        for i in range(40):
+            if 10 <= i < 30:
+                poses.append(create_test_pose(wrist_y=0.3, shoulder_y=0.5))
+            else:
+                poses.append(create_test_pose(wrist_y=0.6, shoulder_y=0.5))
+
+        shots = detector.detect(poses)
+
+        if len(shots) > 0:
+            # Should be flagged as low confidence
+            assert shots[0].low_confidence == True
+
+    def test_high_confidence_not_flagged(self):
+        """Test that high confidence shots are not flagged."""
+        detector = ShotDetector(
+            height_threshold=0.1,
+            min_duration=10,
+            confidence_threshold=0.0,
+            low_confidence_threshold=0.1,  # Very low threshold
+        )
+
+        poses = []
+        for i in range(40):
+            if 10 <= i < 30:
+                poses.append(create_test_pose(wrist_y=0.3, shoulder_y=0.5))
+            else:
+                poses.append(create_test_pose(wrist_y=0.6, shoulder_y=0.5))
+
+        shots = detector.detect(poses)
+
+        if len(shots) > 0:
+            # Should not be flagged
+            assert shots[0].low_confidence == False
+
+
+class TestIntegration:
+    """Integration tests for confidence scoring and type prediction."""
+
+    def test_full_detection_with_type_prediction(self):
+        """Test complete detection pipeline with type prediction."""
+        detector = ShotDetector(
+            height_threshold=0.1,
+            min_duration=10,
+            confidence_threshold=0.0,
+        )
+
+        poses = []
+        for i in range(60):
+            if 15 <= i < 45:
+                poses.append(create_test_pose(wrist_y=0.3, shoulder_y=0.5))
+            else:
+                poses.append(create_test_pose(wrist_y=0.6, shoulder_y=0.5))
+
+        shots = detector.detect(poses)
+
+        assert len(shots) >= 1
+        for shot in shots:
+            assert 0.0 <= shot.confidence <= 1.0
+            assert shot.shot_type in ["smash", "vibora", "bandeja", "unknown"]
+            assert 0.0 <= shot.type_confidence <= 1.0
+            assert shot.low_confidence in [True, False]
+
+    def test_detected_shot_dataclass_complete(self):
+        """Test that DetectedShot has all required fields."""
+        shot = DetectedShot(
+            start_frame=10,
+            end_frame=30,
+            confidence=0.75,
+            shot_type="vibora",
+            type_confidence=0.65,
+            low_confidence=False,
+        )
+
+        assert shot.start_frame == 10
+        assert shot.end_frame == 30
+        assert shot.confidence == 0.75
+        assert shot.shot_type == "vibora"
+        assert shot.type_confidence == 0.65
+        assert shot.low_confidence is False
+
+    def test_multiple_shots_with_different_types(self):
+        """Test detection of multiple shots with potentially different types."""
+        detector = ShotDetector(
+            height_threshold=0.1,
+            min_duration=10,
+            merge_gap=5,
+            confidence_threshold=0.0,
+        )
+
+        # Create two shots
+        poses = []
+        for i in range(100):
+            if 10 <= i < 30 or 60 <= i < 80:
+                poses.append(create_test_pose(wrist_y=0.3, shoulder_y=0.5))
+            else:
+                poses.append(create_test_pose(wrist_y=0.6, shoulder_y=0.5))
+
+        shots = detector.detect(poses)
+
+        # Should detect multiple shots
+        assert len(shots) >= 1
+
+        # Each shot should have type prediction
+        for shot in shots:
+            assert shot.shot_type is not None
+            assert shot.type_confidence >= 0.0
+
+
+class TestEdgeCasesEnhanced:
+    """Edge case tests for enhanced confidence and type prediction."""
+
+    def test_very_short_duration(self):
+        """Test with minimum duration shots."""
+        detector = ShotDetector(
+            height_threshold=0.1,
+            min_duration=15,
+            confidence_threshold=0.0,
+        )
+
+        # Create exactly 15 frame overhead window
+        poses = []
+        for i in range(35):
+            if 10 <= i < 25:
+                poses.append(create_test_pose(wrist_y=0.3, shoulder_y=0.5))
+            else:
+                poses.append(create_test_pose(wrist_y=0.6, shoulder_y=0.5))
+
+        shots = detector.detect(poses)
+
+        if len(shots) > 0:
+            # Should have lower duration score
+            assert shots[0].confidence >= 0.0
+
+    def test_all_nan_velocity_in_window(self):
+        """Test handling of NaN velocity values."""
+        detector = ShotDetector()
+
+        # Create signals with NaN velocity
+        height_signal = np.array([0.2] * 30)
+        velocity_signal = np.array([np.nan] * 30)
+        pose_quality = np.ones(30)
+
+        confidence = detector._calculate_confidence(
+            height_signal, velocity_signal, pose_quality, 5, 25
+        )
+
+        # Should still return a valid confidence
+        assert 0.0 <= confidence <= 1.0
+
+    def test_zero_velocity(self):
+        """Test with zero velocity values."""
+        detector = ShotDetector()
+
+        velocity = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
+
+        prominence_score = detector._calculate_peak_prominence_score(velocity)
+        snr_score = detector._calculate_snr_score(velocity)
+
+        assert 0.0 <= prominence_score <= 1.0
+        assert 0.0 <= snr_score <= 1.0
+
+    def test_boundary_values_classification(self):
+        """Test classification at boundary values."""
+        detector = ShotDetector()
+
+        # Test at exactly threshold values
+        boundaries = [0.0, 0.3, 0.5, 0.65, 0.8, 1.0]
+
+        for h in boundaries:
+            for v in boundaries:
+                shot_type, confidence = detector._classify_by_features(h, v)
+                assert shot_type in ["smash", "vibora", "bandeja"]
+                assert 0.0 <= confidence <= 1.0
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

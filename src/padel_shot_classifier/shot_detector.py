@@ -26,6 +26,7 @@ class DetectedShot:
     confidence: float
     shot_type: str = "unknown"
     type_confidence: float = 0.0
+    low_confidence: bool = False
 
 
 class ShotDetector:
@@ -41,6 +42,8 @@ class ShotDetector:
         confidence_threshold: float = 0.5,
         peak_prominence: float = 0.01,
         refine_boundaries: bool = True,
+        type_confidence_threshold: float = 0.5,
+        low_confidence_threshold: float = 0.7,
     ):
         """
         Initialize shot detector with configurable parameters.
@@ -54,6 +57,8 @@ class ShotDetector:
             confidence_threshold: Minimum confidence to report a detection
             peak_prominence: Minimum prominence for velocity peak detection
             refine_boundaries: Whether to refine boundaries using velocity analysis
+            type_confidence_threshold: Minimum confidence to assign a shot type
+            low_confidence_threshold: Threshold below which to flag as low confidence
         """
         self.height_threshold = height_threshold
         self.min_duration = min_duration
@@ -63,6 +68,8 @@ class ShotDetector:
         self.confidence_threshold = confidence_threshold
         self.peak_prominence = peak_prominence
         self.refine_boundaries = refine_boundaries
+        self.type_confidence_threshold = type_confidence_threshold
+        self.low_confidence_threshold = low_confidence_threshold
 
     def detect(self, pose_data: List[Optional[Dict]]) -> List[DetectedShot]:
         """
@@ -90,10 +97,12 @@ class ShotDetector:
         # Filter by duration
         windows = self._filter_by_duration(windows)
 
+        # Calculate velocity signal (needed for refinement and confidence)
+        velocity_signal = calculate_wrist_velocity_signal(pose_data)
+        smoothed_velocity = smooth_signal(velocity_signal, self.smoothing_window)
+
         # Refine boundaries using velocity analysis
         if self.refine_boundaries and len(windows) > 0:
-            velocity_signal = calculate_wrist_velocity_signal(pose_data)
-            smoothed_velocity = smooth_signal(velocity_signal, self.smoothing_window)
             windows = self._refine_boundaries(windows, smoothed_velocity)
             # Re-filter by duration after refinement
             windows = self._filter_by_duration(windows)
@@ -104,13 +113,28 @@ class ShotDetector:
 
         for start, end in windows:
             confidence = self._calculate_confidence(
-                smoothed_height, pose_quality, start, end
+                smoothed_height, smoothed_velocity, pose_quality, start, end
             )
             if confidence >= self.confidence_threshold:
+                # Predict shot type
+                shot_type, type_confidence = self._predict_shot_type(
+                    pose_data, smoothed_velocity, smoothed_height, start, end
+                )
+
+                # Mark as unknown if type confidence is too low
+                if type_confidence < self.type_confidence_threshold:
+                    shot_type = "unknown"
+
+                # Flag low confidence detections
+                low_confidence = confidence < self.low_confidence_threshold
+
                 detected_shots.append(DetectedShot(
                     start_frame=start,
                     end_frame=end,
                     confidence=confidence,
+                    shot_type=shot_type,
+                    type_confidence=type_confidence,
+                    low_confidence=low_confidence,
                 ))
 
         return detected_shots
@@ -195,7 +219,8 @@ class ShotDetector:
 
     def _calculate_confidence(
         self,
-        signal: np.ndarray,
+        height_signal: np.ndarray,
+        velocity_signal: np.ndarray,
         pose_quality: np.ndarray,
         start: int,
         end: int,
@@ -207,9 +232,13 @@ class ShotDetector:
         - Signal strength (how high above threshold)
         - Pose quality (how many valid keypoints)
         - Signal clarity (low variance = clearer pattern)
+        - Peak velocity prominence (clear peak = high confidence)
+        - Signal-to-noise ratio in velocity
+        - Window duration reasonableness
 
         Args:
-            signal: Smoothed height signal
+            height_signal: Smoothed height signal
+            velocity_signal: Smoothed velocity signal
             pose_quality: Quality scores per frame
             start: Window start frame
             end: Window end frame
@@ -217,37 +246,307 @@ class ShotDetector:
         Returns:
             Confidence score between 0 and 1
         """
-        window_signal = signal[start:end]
+        window_height = height_signal[start:end]
+        window_velocity = velocity_signal[start:end]
         window_quality = pose_quality[start:end]
 
         # Remove NaN for calculations
-        valid_signal = window_signal[~np.isnan(window_signal)]
+        valid_height = window_height[~np.isnan(window_height)]
+        valid_velocity = window_velocity[~np.isnan(window_velocity)]
 
-        if len(valid_signal) == 0:
+        if len(valid_height) == 0:
             return 0.0
 
         # Signal strength: how much above threshold
-        mean_height = np.mean(valid_signal)
+        mean_height = np.mean(valid_height)
         strength_score = min(1.0, (mean_height - self.height_threshold) / 0.2)
 
         # Pose quality: average quality in window
         quality_score = np.mean(window_quality)
 
         # Signal clarity: inverse of coefficient of variation
-        if np.mean(valid_signal) > 0:
-            cv = np.std(valid_signal) / np.mean(valid_signal)
+        if np.mean(valid_height) > 0:
+            cv = np.std(valid_height) / np.mean(valid_height)
             clarity_score = max(0.0, 1.0 - cv)
         else:
             clarity_score = 0.0
 
-        # Weighted combination
+        # Peak velocity prominence score
+        prominence_score = self._calculate_peak_prominence_score(valid_velocity)
+
+        # Signal-to-noise ratio score
+        snr_score = self._calculate_snr_score(valid_velocity)
+
+        # Duration reasonableness score
+        duration = end - start
+        duration_score = self._calculate_duration_score(duration)
+
+        # Weighted combination (enhanced with new factors)
         confidence = (
-            0.4 * strength_score +
-            0.4 * quality_score +
-            0.2 * clarity_score
+            0.25 * strength_score +
+            0.25 * quality_score +
+            0.15 * clarity_score +
+            0.15 * prominence_score +
+            0.10 * snr_score +
+            0.10 * duration_score
         )
 
         return max(0.0, min(1.0, confidence))
+
+    def _calculate_peak_prominence_score(self, velocity: np.ndarray) -> float:
+        """
+        Calculate score based on peak velocity prominence.
+
+        A clear, prominent peak indicates a confident detection.
+
+        Args:
+            velocity: Valid velocity values in window
+
+        Returns:
+            Score between 0 and 1
+        """
+        if len(velocity) < 3:
+            return 0.0
+
+        # Find peaks
+        peaks, properties = find_peaks(velocity, prominence=0.001)
+
+        if len(peaks) == 0:
+            return 0.3  # No peaks, low confidence
+
+        # Get the highest prominence
+        prominences = properties['prominences']
+        max_prominence = np.max(prominences)
+
+        # Normalize by signal range
+        signal_range = np.max(velocity) - np.min(velocity)
+        if signal_range == 0:
+            return 0.3
+
+        # Score based on prominence relative to signal range
+        relative_prominence = max_prominence / signal_range
+        return min(1.0, relative_prominence * 1.5)
+
+    def _calculate_snr_score(self, velocity: np.ndarray) -> float:
+        """
+        Calculate signal-to-noise ratio score.
+
+        Higher SNR indicates clearer signal.
+
+        Args:
+            velocity: Valid velocity values in window
+
+        Returns:
+            Score between 0 and 1
+        """
+        if len(velocity) < 3:
+            return 0.0
+
+        # Signal: peak value
+        signal_power = np.max(velocity)
+
+        # Noise: standard deviation of lower half of values
+        sorted_vals = np.sort(velocity)
+        lower_half = sorted_vals[:len(sorted_vals) // 2]
+        noise_power = np.std(lower_half) if len(lower_half) > 1 else 0.01
+
+        if noise_power == 0:
+            return 1.0
+
+        # SNR in linear scale
+        snr = signal_power / noise_power
+
+        # Convert to score (SNR of 5 = good, 10+ = excellent)
+        return min(1.0, snr / 10.0)
+
+    def _calculate_duration_score(self, duration: int) -> float:
+        """
+        Calculate score based on duration reasonableness.
+
+        Shots with typical durations get higher scores.
+
+        Args:
+            duration: Shot duration in frames
+
+        Returns:
+            Score between 0 and 1
+        """
+        # Optimal duration range (roughly 30-60 frames at 30fps = 1-2 seconds)
+        optimal_min = 30
+        optimal_max = 60
+
+        if optimal_min <= duration <= optimal_max:
+            return 1.0
+
+        # Score decreases as we move away from optimal range
+        if duration < optimal_min:
+            # Too short
+            return max(0.3, duration / optimal_min)
+        else:
+            # Too long
+            ratio = optimal_max / duration
+            return max(0.3, ratio)
+
+    def _predict_shot_type(
+        self,
+        pose_data: List[Optional[Dict]],
+        velocity_signal: np.ndarray,
+        height_signal: np.ndarray,
+        start: int,
+        end: int,
+    ) -> Tuple[str, float]:
+        """
+        Predict shot type using biomechanical heuristics.
+
+        Uses contact height and velocity patterns to classify:
+        - Smash: highest contact point, fastest velocity
+        - Vibora: medium contact, moderate velocity
+        - Bandeja: lower contact, controlled velocity
+
+        Args:
+            pose_data: List of pose dictionaries
+            velocity_signal: Smoothed velocity signal
+            height_signal: Smoothed height signal
+            start: Window start frame
+            end: Window end frame
+
+        Returns:
+            Tuple of (shot_type, type_confidence)
+        """
+        # Extract features from window
+        window_velocity = velocity_signal[start:end]
+        window_height = height_signal[start:end]
+
+        # Remove NaN values
+        valid_velocity = window_velocity[~np.isnan(window_velocity)]
+        valid_height = window_height[~np.isnan(window_height)]
+
+        if len(valid_velocity) == 0 or len(valid_height) == 0:
+            return ("unknown", 0.0)
+
+        # Calculate key features
+        max_velocity = float(np.max(valid_velocity))
+        max_height = float(np.max(valid_height))
+
+        # Normalize height to relative scale (0-1)
+        # Height signal is shoulder_y - wrist_y, positive when wrist above shoulder
+        # Typical range: 0.1 to 0.4 for overhead shots
+        relative_height = min(1.0, max_height / 0.4)
+
+        # Normalize velocity (typical range: 0.01 to 0.15 for shots)
+        relative_velocity = min(1.0, max_velocity / 0.15)
+
+        # Predict shot type using heuristics
+        shot_type, type_confidence = self._classify_by_features(
+            relative_height, relative_velocity
+        )
+
+        return (shot_type, type_confidence)
+
+    def _classify_by_features(
+        self,
+        relative_height: float,
+        relative_velocity: float,
+    ) -> Tuple[str, float]:
+        """
+        Classify shot type based on relative height and velocity.
+
+        Heuristic thresholds:
+        - Smash: height > 0.8, velocity > 0.7
+        - Vibora: height 0.5-0.8, velocity 0.4-0.7
+        - Bandeja: height < 0.5, velocity < 0.5
+
+        Args:
+            relative_height: Normalized contact height (0-1)
+            relative_velocity: Normalized max velocity (0-1)
+
+        Returns:
+            Tuple of (shot_type, type_confidence)
+        """
+        # Calculate scores for each type
+        smash_score = self._smash_score(relative_height, relative_velocity)
+        vibora_score = self._vibora_score(relative_height, relative_velocity)
+        bandeja_score = self._bandeja_score(relative_height, relative_velocity)
+
+        # Find best match
+        scores = {
+            "smash": smash_score,
+            "vibora": vibora_score,
+            "bandeja": bandeja_score,
+        }
+
+        best_type = max(scores, key=scores.get)
+        best_score = scores[best_type]
+
+        # Calculate confidence based on score margin
+        sorted_scores = sorted(scores.values(), reverse=True)
+        if len(sorted_scores) >= 2:
+            margin = sorted_scores[0] - sorted_scores[1]
+            # Higher margin = higher confidence
+            type_confidence = min(1.0, best_score * (1 + margin))
+        else:
+            type_confidence = best_score
+
+        return (best_type, type_confidence)
+
+    def _smash_score(self, height: float, velocity: float) -> float:
+        """
+        Calculate score for smash classification.
+
+        Smash: highest contact point (> 0.8), fastest velocity (> 0.7)
+        """
+        height_score = max(0, (height - 0.6) / 0.4)  # 0 at 0.6, 1 at 1.0
+        velocity_score = max(0, (velocity - 0.5) / 0.5)  # 0 at 0.5, 1 at 1.0
+
+        return (height_score * 0.5 + velocity_score * 0.5)
+
+    def _vibora_score(self, height: float, velocity: float) -> float:
+        """
+        Calculate score for vibora classification.
+
+        Vibora: medium contact (0.5-0.8), moderate velocity (0.4-0.7)
+        """
+        # Optimal height: 0.5-0.8, peak at 0.65
+        if height < 0.3:
+            height_score = 0
+        elif height < 0.5:
+            height_score = (height - 0.3) / 0.2
+        elif height <= 0.8:
+            height_score = 1.0 - abs(height - 0.65) / 0.35
+        else:
+            height_score = max(0, 1.0 - (height - 0.8) / 0.2)
+
+        # Optimal velocity: 0.4-0.7, peak at 0.55
+        if velocity < 0.2:
+            velocity_score = 0
+        elif velocity < 0.4:
+            velocity_score = (velocity - 0.2) / 0.2
+        elif velocity <= 0.7:
+            velocity_score = 1.0 - abs(velocity - 0.55) / 0.35
+        else:
+            velocity_score = max(0, 1.0 - (velocity - 0.7) / 0.3)
+
+        return (height_score * 0.5 + velocity_score * 0.5)
+
+    def _bandeja_score(self, height: float, velocity: float) -> float:
+        """
+        Calculate score for bandeja classification.
+
+        Bandeja: lower contact (< 0.5), controlled/lower velocity (< 0.5)
+        """
+        # Lower height is better, peak at 0.3
+        if height <= 0.5:
+            height_score = 1.0 - height / 0.5
+        else:
+            height_score = max(0, 0.5 - (height - 0.5))
+
+        # Lower velocity is better, peak at 0.3
+        if velocity <= 0.5:
+            velocity_score = 1.0 - velocity / 0.5
+        else:
+            velocity_score = max(0, 0.5 - (velocity - 0.5))
+
+        return (height_score * 0.5 + velocity_score * 0.5)
 
     def _refine_boundaries(
         self,

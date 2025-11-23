@@ -7,9 +7,20 @@ readme = "README.md"
 packages = [{include = "padel_shot_classifier", from = "src"}]
 
 [tool.poetry.dependencies]
-python = "^3.13"
+python = "^3.11"
+jaxlib = "0.4.25"
+mediapipe = "^0.10.9"
+opencv-python = "^4.10.0"
+scikit-learn = "^1.5.0"
+numpy = "^1.24.0"
+pandas = "^2.2.0"
+matplotlib = "^3.9.0"
+seaborn = "^0.13.0"
+tqdm = "^4.66.0"
+torch = "2.1.2"
 
 [tool.poetry.group.dev.dependencies]
+pytest = "^9.0.1"
 
 [build-system]
 requires = ["poetry-core>=2.0.0"]
